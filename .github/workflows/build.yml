@@ -1,0 +1,114 @@
+name: Windows build
+
+# 在 GitHub Actions 上构建 Windows 绿色版与应用安装包，产物直接挂在本次运行里；
+# 推送 v* 标签时同时发布到 GitHub Release。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - local/release
+    tags:
+      - 'v*'
+    paths:
+      - 'app/**'
+      - 'packaging/**'
+      - 'pdf-manage.spec'
+      - 'requirements.txt'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'packaging/**'
+      - 'pdf-manage.spec'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install pinned build dependencies
+        run: python -m pip install --disable-pip-version-check -r packaging/requirements-build.txt
+
+      - name: Show program version
+        run: python -c "from app import __version__; print('version', __version__)"
+
+      - name: Check release tag matches program version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python packaging/check_version.py
+
+      - name: Compile all sources
+        run: python -m compileall -q app packaging run.py
+
+      - name: Build application icons
+        run: python packaging/make_icon.py
+
+      - name: Build directory application with PyInstaller
+        run: python -m PyInstaller --noconfirm --clean --workpath build/onedir pdf-manage.spec
+
+      - name: Inspect the packaged application
+        run: python packaging/verify_exe.py --skip-runtime
+
+      - name: Build portable zip
+        run: python packaging/make_portable.py
+
+      - name: Build setup installer
+        shell: pwsh
+        run: |
+          $setupCompiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $setupCompiler) {
+            $setupCompiler = @(
+              "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe",
+              "$env:ProgramFiles/Inno Setup 6/ISCC.exe",
+              "${env:ProgramFiles(x86)}/Inno Setup 7/ISCC.exe",
+              "$env:ProgramFiles/Inno Setup 7/ISCC.exe"
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          if (-not $setupCompiler) { throw 'Inno Setup compiler not found on this runner.' }
+          $installerOutput = Join-Path $PWD.Path 'dist-installer'
+          New-Item -ItemType Directory -Path $installerOutput -Force | Out-Null
+          & $setupCompiler "/O$installerOutput" 'packaging/pdf-manage.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
+          if (-not (Test-Path -LiteralPath 'dist-installer/ZhiXuPDF-Setup.exe')) {
+            throw 'dist-installer/ZhiXuPDF-Setup.exe was not produced.'
+          }
+          python packaging/verify_exe.py --skip-runtime --installer dist-installer/ZhiXuPDF-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Installer version validation failed.' }
+
+      - name: Collect build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-report
+          path: build/build-report.json
+          if-no-files-found: warn
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZhiXuPDF-windows
+          path: |
+            dist-portable/ZhiXuPDF-Portable-*.zip
+            dist-installer/ZhiXuPDF-Setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-portable/ZhiXuPDF-Portable-*.zip
+            dist-installer/ZhiXuPDF-Setup.exe
